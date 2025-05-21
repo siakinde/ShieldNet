@@ -242,4 +242,73 @@
   )
 )
 
+;; process-claim: Finalizes a claim after voting period ends
+;; This function counts votes, determines if the claim is approved,
+;; updates claim status, and transfers funds if approved.
+;; @param claim-id: The ID of the claim to process
+;; @returns: (ok true) if claim was approved, (ok false) if rejected, or an error code
+;; Error codes:
+;; - u12: Claim not found
+;; - u13: Vote counts not found
+;; - u14: Claim not in active status
+;; - u15: Voting period not yet ended
+;; - u16: Insufficient pool funds to pay claim
+(define-public (process-claim (claim-id uint)) 
+  (let (
+    ;; Retrieve claim and vote information
+    (claim (unwrap! (map-get? claims { claim-id: claim-id }) (err u12)))
+    (vote-counts (unwrap! (map-get? claim-vote-counts { claim-id: claim-id }) (err u13)))
+    
+    ;; Calculate total votes and approval percentage
+    (total-votes (+ (get approve vote-counts) (get reject vote-counts)))
+    (approval-percentage (if (> total-votes u0)
+                           (* u100 (/ (get approve vote-counts) total-votes))
+                           u0))
+    
+    ;; Extract claim details
+    (claimant (get claimant claim))
+    (claim-amount (get amount claim))
+    
+    ;; Determine claim status
+    (voting-ended (> block-height (get voting-ends-at claim)))
+    (is-approved (>= approval-percentage claim-approval-threshold))
+  )
+    ;; Validate claim is eligible for processing
+    (asserts! (is-eq (get status claim) u"active") (err u14))
+    (asserts! voting-ended (err u15))
+    
+    ;; Update claim status based on vote results
+    (map-set claims 
+      { claim-id: claim-id } 
+      (merge claim { status: (if is-approved u"approved" u"rejected") })
+    )
+    
+    ;; If approved, process the payout
+    (if is-approved
+      (begin
+        ;; Ensure pool has enough funds for payout
+        (asserts! (<= claim-amount (var-get pool-balance)) (err u16))
+        
+        ;; Update pool balance
+        (var-set pool-balance (- (var-get pool-balance) claim-amount))
+        
+        ;; Transfer funds to claimant
+        (try! (as-contract (stx-transfer? claim-amount (as-contract tx-sender) claimant)))
+        
+        ;; Emit event for transparency and off-chain tracking
+        (print { event: "claim-approved", claim-id: claim-id, amount: claim-amount, recipient: claimant })
+        
+        ;; Update total deposits record for historical tracking
+        (map-set total-deposits block-height (var-get pool-balance))
+        
+        (ok true)
+      )
+      (begin
+        ;; Claim was rejected - emit event but no funds transfer
+        (print { event: "claim-rejected", claim-id: claim-id, votes-for: (get approve vote-counts), votes-against: (get reject vote-counts) })
+        (ok false)
+      )
+    )
+  )
+)
 
